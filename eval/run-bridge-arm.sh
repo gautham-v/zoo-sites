@@ -9,10 +9,11 @@
 #   BACKEND=anthropic MODEL=claude-haiku-5-5 eval/run-bridge-arm.sh --task title
 BRIDGE=${BRIDGE_REPO:-$HOME/Code/personal/firefox-agent-bridge}
 NODE=${NODE_BIN:-$(command -v node)}
+# BRIDGE_EXPERIMENTS is passed to the bridge as FIREFOX_BRIDGE_EXPERIMENTS (its A/B flags).
 BACKEND=${BACKEND:-codex}
 MODEL=${MODEL:-gpt-5.6-luna}
 [ -f "$BRIDGE/mcp/server.mjs" ] || { echo "set BRIDGE_REPO to a firefox-agent-bridge checkout" >&2; exit 1; }
 cd "$(dirname "$0")/.." || exit 1
 exec node eval/run.mjs --suite all --backend "$BACKEND" --model "$MODEL" --effort medium \
   --conditions "${CONDITIONS:-firefox-devtools-mcp}" --seed ab-1 \
-  --mcp-command "env FIREFOX_BRIDGE_DEVTOOLS=1 BRIDGE_PROXY_LOG=${BRIDGE_PROXY_LOG:-/tmp/bridge-proxy.log} $NODE $PWD/eval/bridge-session-server.mjs $BRIDGE/mcp/server.mjs" "$@"
+  --mcp-command "env FIREFOX_BRIDGE_DEVTOOLS=1 ${BRIDGE_EXPERIMENTS:+FIREFOX_BRIDGE_EXPERIMENTS=$BRIDGE_EXPERIMENTS }BRIDGE_PROXY_LOG=${BRIDGE_PROXY_LOG:-/tmp/bridge-proxy.log} $NODE $PWD/eval/bridge-session-server.mjs $BRIDGE/mcp/server.mjs" "$@"
