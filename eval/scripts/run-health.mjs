@@ -651,7 +651,9 @@ function checkTap({ meta, results, facts }) {
     }
     compared++;
     const tools = (x) => JSON.stringify(Object.entries(x).sort(([a], [b]) => a.localeCompare(b)));
-    const agree = f.tap.calls === f.stream.calls && tools(f.tap.tools) === tools(f.stream.tools);
+    // playwright-cli's calls are shell commands, which the transcript's MCP calls never show.
+    const shellDriven = String(r.condition).split('/').pop() === 'playwright-cli';
+    const agree = shellDriven || (f.tap.calls === f.stream.calls && tools(f.tap.tools) === tools(f.stream.tools));
     const rowAgrees = r.surface_calls == null || r.surface_calls === f.tap.calls;
     if (r.tap_mismatch) flagged.push(rowName(r));
     if (agree && rowAgrees) continue;

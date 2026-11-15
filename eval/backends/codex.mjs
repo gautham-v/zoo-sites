@@ -327,7 +327,7 @@ export function codexConfig({ home, mcpStdio, effort, path, mcpEnvVars = [], ser
         TMPPREFIX: join(shellTmp, 'zsh'),
       },
     },
-    mcp_servers: {
+    ...(mcpStdio ? { mcp_servers: {
       firefox: {
         command: mcpStdio.command,
         args: mcpStdio.args,
@@ -348,7 +348,7 @@ export function codexConfig({ home, mcpStdio, effort, path, mcpEnvVars = [], ser
         startup_timeout_sec: 60,
         tool_timeout_sec: 180,
       },
-    },
+    } } : {}),
   };
 }
 

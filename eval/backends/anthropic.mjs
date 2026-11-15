@@ -343,6 +343,9 @@ export function agentOptions({
   };
 }
 
+// Its MCP config needs a server, which playwright-cli has none of.
+export const supportsCondition = (condition) => condition !== 'playwright-cli';
+
 export async function run({
   prompt, model, effort, env, cwd, onMessage, onOutputTokens, mcpStdio, abortController, shellPath, serverOutputDirs,
 }) {

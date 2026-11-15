@@ -91,6 +91,10 @@ import { shellAssisted } from './scripts/row-evidence.mjs';
 import { healthLine, PRICE_TABLE, runHealth } from './scripts/run-health.mjs';
 import { createReachRecorder, gradedValues, truthValues } from './surface-reach.mjs';
 import { detectScreen, windowGrid } from './window-grid.mjs';
+import {
+  PLAYWRIGHT_CLI, cliConfig, cliEnv, cliExec, cliInfo, cliToolStats, cliToolsInfo, cliWindows,
+  prepareCliWorkspace, startCliBroker,
+} from './playwright-cli-arm.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -838,7 +842,7 @@ const builtInDevtools = (c) => isDevtools(c) && !(c === DEVTOOLS && CUSTOM_MCP);
 // resolves FIREFOX_DEVTOOLS_MCP or the dependency.
 const devtoolsRootFor = (c) => (c === DEVTOOLS ? undefined : DEVTOOLS_BUILDS.get(c.slice(DEVTOOLS.length + 1)));
 
-const KNOWN_CONDITIONS = [DEVTOOLS, 'playwright-mcp', ...BUILD_CONDITIONS];
+const KNOWN_CONDITIONS = [DEVTOOLS, 'playwright-mcp', PLAYWRIGHT_CLI, ...BUILD_CONDITIONS];
 const CONDITIONS = listOf(
   rerunValue(
     '--conditions',
@@ -1010,8 +1014,14 @@ ${SHELL_NOTE}`;
 // codex home that leaked the operator's servers, say) is foreign.
 const SURFACE_SERVER = 'firefox';
 
-function taskPrompt(task) {
-  return `${MCP_INTRO}\n\nTask: ${task.ask}\nAnswer concisely with the requested information.`;
+// playwright-cli has no MCP server: the same two sentences, naming the command.
+const CLI_INTRO = `You control a web browser via the \`playwright-cli\` command in your shell (Bash).
+You also have that shell for anything else you find useful.
+The \`playwright-cli\` command is how you drive the page.`;
+
+function taskPrompt(task, condition = null) {
+  const intro = condition === PLAYWRIGHT_CLI ? CLI_INTRO : MCP_INTRO;
+  return `${intro}\n\nTask: ${task.ask}\nAnswer concisely with the requested information.`;
 }
 
 // Playwright drives its own Firefox build; download it (no-op when present)
@@ -1076,7 +1086,7 @@ const TAG_MECHANISM = {
   'playwright-mcp': 'contextOptions.userAgent',
 };
 const tagMechanismFor = (condition) =>
-  condition === 'playwright-mcp' ? TAG_MECHANISM['playwright-mcp'] : builtInDevtools(condition) ? TAG_MECHANISM[DEVTOOLS] : null;
+  condition === 'playwright-mcp' || condition === PLAYWRIGHT_CLI ? TAG_MECHANISM['playwright-mcp'] : builtInDevtools(condition) ? TAG_MECHANISM[DEVTOOLS] : null;
 const PREFLIGHT_ENV = {};
 const TAGGABLE = new Set();
 function browserTag(condition) {
@@ -1146,7 +1156,18 @@ const serverDownloadDirsFor = (condition, privateDir) =>
     ? { '~/.firefox-devtools-mcp/output/downloads': join(devtoolsHome(privateDir), '.firefox-devtools-mcp', 'output', 'downloads') }
     : {};
 
+const cliConfigFor = (outputDir, userAgent = null) =>
+  cliConfig({
+    outputDir,
+    viewport: BROWSER_PINS.viewport,
+    colorScheme: BROWSER_PINS.colorScheme,
+    firefoxUserPrefs: PINNED_PREFS,
+    userAgent,
+    headed: HEADED,
+  });
+
 function serverSpecFor(condition, { downloadsDir, privateDir, profileDir, userAgent }) {
+  if (condition === PLAYWRIGHT_CLI) return null;
   if (condition === 'playwright-mcp') {
     return {
       command: process.execPath,
@@ -1204,7 +1225,7 @@ function serverSpecFor(condition, { downloadsDir, privateDir, profileDir, userAg
 // its cache.
 let playwrightBinary;
 function browserBuildFor(condition) {
-  if (condition === 'playwright-mcp') {
+  if (condition === 'playwright-mcp' || condition === PLAYWRIGHT_CLI) {
     playwrightBinary ??= playwrightFirefox();
     return firefoxBuild(playwrightBinary, 'playwright');
   }
@@ -1339,6 +1360,39 @@ async function verifyTag(condition, probe, tools) {
   return { mechanism, verified, ...(verified ? {} : { sent }) };
 }
 
+// playwright-cli's preflight: the real CLI, in a workspace laid out as an
+// attempt's, opens the probe page and reports the browser's environment.
+async function cliPreflight(probe, path, userAgent = null) {
+  const dir = makeTempDir(TEMP_PREFIX.attempt);
+  const privateDir = makeTempDir(TEMP_PREFIX.home);
+  const outputDir = join(dir, serverDirName(PLAYWRIGHT_CLI));
+  mkdirSync(outputDir);
+  prepareCliWorkspace(dir, cliConfigFor(outputDir, userAgent));
+  const opts = { cwd: dir, env: cliEnv(agentEnvFor(null), privateDir), timeoutMs: 90000 };
+  const run = async (...args) => {
+    const r = await cliExec(args, opts);
+    if (r.code !== 0 || /^### Error/m.test(r.stdout)) throw new Error(`playwright-cli ${args[0]} failed: ${(r.stderr || r.stdout).slice(0, 300)}`);
+    return r.stdout;
+  };
+  try {
+    await run('open', probe.url + path);
+    const text = await run('eval', ENV_PROBE);
+    const encoded = text.match(/ZOOENV([A-Za-z0-9\-_.!~*'()%]*)ZOOENV/)?.[1];
+    if (encoded == null) throw new Error(`playwright-cli eval returned no environment: ${text.slice(0, 300)}`);
+    const page = JSON.parse(decodeURIComponent(encoded));
+    return {
+      firefox: page.userAgent.match(/Firefox\/([\d.]+)/)?.[1] ?? null,
+      acceptLanguage: probe.headersAt(path)['accept-language'] ?? null,
+      ...page,
+    };
+  } finally {
+    await cliExec(['close-all'], { ...opts, timeoutMs: 15000 });
+    spawnSync('pkill', ['-f', privateDir]);
+    removeTempDir(dir);
+    removeTempDir(privateDir);
+  }
+}
+
 // Free checks before any paid work. A crashing --mcp-command, or a server that
 // needs a variable the environment allowlist drops, otherwise leaves every
 // agent with only Bash, and the run grades that as the surface. The server gets
@@ -1353,6 +1407,34 @@ async function preflight() {
   const probe = await startProbeServer();
   try {
     for (const condition of CONDITIONS) {
+      if (condition === PLAYWRIGHT_CLI) {
+        tools[condition] = cliToolsInfo();
+        try {
+          env[condition] = { ...(await cliPreflight(probe, `/${condition}`)), build: browserBuildFor(condition) };
+        } catch (error) {
+          throw new Error(`preflight: ${condition} did not open its browser and load a page, so no agent ran:\n${error.message}`);
+        }
+        const e = env[condition];
+        console.log(
+          `(preflight: ${condition} has ${tools[condition].count} commands, no tool schema, a ${tools[condition].skill.chars}-char skill file; ` +
+            `Firefox ${e.firefox}, ${e.locale}, ${e.timeZone}, ${e.viewport}, ${e.colorScheme}, pdf.js ${e.pdfViewerEnabled ? 'on' : 'off'})`
+        );
+        PREFLIGHT_ENV[condition] = e;
+        const token = randomBytes(4).toString('hex');
+        const path = `/${condition}/tag-${token}`;
+        let tag;
+        try {
+          await cliPreflight(probe, path, `${e.userAgent} ${token}`);
+          const sent = probe.headersAt(path)['user-agent'] ?? null;
+          const verified = sent === `${e.userAgent} ${token}`;
+          if (verified) TAGGABLE.add(condition);
+          tag = { mechanism: tagMechanismFor(condition), verified, ...(verified ? {} : { sent }) };
+        } catch (error) {
+          tag = { mechanism: tagMechanismFor(condition), verified: false, why: String(error?.message ?? error).slice(0, 200) };
+        }
+        e.tag = tag;
+        continue;
+      }
       let launched;
       try {
         launched = await preflightServer(condition);
@@ -1472,8 +1554,23 @@ const ACTIVE_STOPS = new Set();
 // about the surface, whatever its grade, so it is marked invalid. Returns the
 // row's fields, and the surface's errors for blameToolErrors once the graded
 // values are known.
-function callTelemetry(recorder, tapLog) {
+function callTelemetry(recorder, tapLog, cliRecords = null) {
   const s = recorder.summary();
+  if (cliRecords) {
+    return {
+      telemetry: {
+        surface_calls: cliRecords.length,
+        foreign_tools: s.foreign_tools,
+        ...(s.foreign_tools ? { foreign_servers: s.foreign_servers } : {}),
+        ...(cliRecords.length === 0 ? { invalid: 'no-surface-calls' } : {}),
+        tools: cliToolStats(cliRecords),
+        snapshot: s.snapshot,
+        friction: s.friction,
+      },
+      toolErrors: s.tool_errors,
+      shellWindows: s.shell_windows,
+    };
+  }
   const records = tapLog ? readTapLog(tapLog) : null;
   const tapped = records ? tapSurfaceCalls(records) : null;
   const surfaceCalls = tapped ? tapped.length : s.surface_calls;
@@ -1570,15 +1667,21 @@ async function runTask(backendName, condition, label, task, ctx, rep = 1, attemp
     tapLog,
   });
   const rollout = ctx.rolloutsDir ? join(ctx.rolloutsDir, transcript) : null;
+  let cliBroker = null;
+  let cliBin = null;
+  if (condition === PLAYWRIGHT_CLI) {
+    cliBin = prepareCliWorkspace(attemptDir, cliConfigFor(downloadsDir, tag?.userAgent ?? null));
+    cliBroker = startCliBroker({ cwd: attemptDir, env: cliEnv(agentEnvFor(null), privateDir), log: tapLog });
+  }
   const spec = {
-    prompt: taskPrompt(task),
+    prompt: taskPrompt(task, condition),
     model: modelFor(backendName),
     effort: EFFORT === 'default' ? null : EFFORT,
     condition,
     cwd: attemptDir,
     mcpStdio,
     env: agentEnvFor(backendName),
-    shellPath: shellPathFor(backendName),
+    shellPath: cliBin ? `${cliBin}:${shellPathFor(backendName)}` : shellPathFor(backendName),
     serverOutputDirs: serverOutputDirsFor(condition, privateDir),
     // Where a backend that keeps its own session record (codex) copies it.
     rolloutPath: rollout,
@@ -1669,10 +1772,11 @@ async function runTask(backendName, condition, label, task, ctx, rep = 1, attemp
     clearTimeout(wallTimer);
     ACTIVE_STOPS.delete(stopFor);
     transcriptStream?.end();
-    await ensureTapExit(tapLog);
+    if (cliBroker) await cliBroker.stop().catch(() => {});
+    else await ensureTapExit(tapLog);
     // Never allowed to cost the attempt its row: telemetry is not the grade.
     try {
-      ({ telemetry, toolErrors, shellWindows } = callTelemetry(calls, tapLog));
+      ({ telemetry, toolErrors, shellWindows } = callTelemetry(calls, tapLog, cliBroker?.records() ?? null));
     } catch (error) {
       telemetry = { telemetry_error: String(error?.message ?? error) };
     }
@@ -1697,7 +1801,11 @@ async function runTask(backendName, condition, label, task, ctx, rep = 1, attemp
       ...(rollout && existsSync(rollout) ? { rollout: `rollouts/${transcript}` } : {}),
     };
     try {
-      foreign = foreignBrowser(ctx.pages?.state?.ledger, { windows: tapWindows(tapLog), shell: shellWindows, token: tag?.token });
+      foreign = foreignBrowser(ctx.pages?.state?.ledger, {
+        windows: cliBroker ? cliWindows(cliBroker.records()) : tapWindows(tapLog),
+        shell: cliBroker ? [] : shellWindows,
+        token: tag?.token,
+      });
     } catch (error) {
       foreign = { error: String(error?.message ?? error) };
     }
@@ -2454,7 +2562,9 @@ function buildMeta(startedAt, selected, env, tools, taskHashes) {
       {
         ...(c === 'playwright-mcp'
           ? playwrightMcpInfo()
-          : custom(c)
+          : c === PLAYWRIGHT_CLI
+            ? cliInfo()
+            : custom(c)
             ? { source: '--mcp-command', command: MCP_COMMAND }
             : devtoolsMcpInfo(devtoolsRootFor(c))),
         tools: tools[c] ?? null,
@@ -2748,7 +2858,7 @@ async function main() {
   }
   // The preflight loads a page in every condition's browser, so Playwright's
   // Firefox has to be installed and the headed grid laid out before it.
-  if (CONDITIONS.includes('playwright-mcp')) {
+  if (CONDITIONS.includes('playwright-mcp') || CONDITIONS.includes(PLAYWRIGHT_CLI)) {
     await ensurePlaywrightFirefox();
   }
   if (HEADED) {

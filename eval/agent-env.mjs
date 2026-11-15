@@ -290,7 +290,8 @@ export function removeAllTempDirs() {
 // write neither (serverDirs); the servers run outside the sandboxes. Plain
 // directories, since `find` and `rg --files` skip a linked one.
 export const SERVER_DIR_NAMES = ['downloads', 'playwright-output'];
-export const serverDirName = (condition) => (condition === 'playwright-mcp' ? 'playwright-output' : 'downloads');
+export const serverDirName = (condition) =>
+  condition === 'playwright-mcp' || condition === 'playwright-cli' ? 'playwright-output' : 'downloads';
 export const serverDirs = (cwd) => (cwd ? SERVER_DIR_NAMES.map((name) => join(cwd, name)) : []);
 
 // Files the MCP servers write for themselves into the download directory, so
